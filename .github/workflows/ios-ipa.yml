@@ -1,0 +1,73 @@
+name: ios-ipa
+
+# Builds the unsigned .ipa for the iPhone app on a GitHub-hosted macOS runner — the "no Mac"
+# path. It is the same recipe as the build:ios job in .gitlab-ci.yml: build:mobile, an unsigned
+# xcodebuild archive, and the .app zipped into Payload/.
+#
+# Sign the result on your own machine (Windows is fine) with Sideloadly and a free Apple ID;
+# Apple expires that signature after 7 days, so re-run and re-sign weekly.
+#
+# Trigger it by hand: Actions → "ios-ipa" → Run workflow.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch or tag to build"
+        required: false
+        default: "main"
+
+permissions:
+  contents: read
+
+jobs:
+  unsigned-ipa:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # VITE_MOBILE=1 vite build → stage the exercise media → cap sync (runs pod install on
+      # macOS) → check the bundle. Same command the maintainers use.
+      - name: Build the mobile web bundle
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build:mobile
+
+      # An .ipa is a zip with the .app under Payload/. No signing identity, so it installs
+      # nowhere by itself — Sideloadly re-signs it with your Apple ID.
+      - name: Archive and package the unsigned .ipa
+        working-directory: frontend/ios/App
+        run: |
+          set -eu
+          VER="$(node -p "require('../../package.json').version")"
+          BUILD="$(sed -n 's/^ *versionCode \([0-9]*\).*/\1/p' ../android/app/build.gradle | sed -n 1p)"
+          [ -n "$BUILD" ] || { echo "could not read versionCode from android/app/build.gradle" >&2; exit 1; }
+          echo "openGym $VER (build $BUILD)"
+          xcodebuild -workspace App.xcworkspace -scheme App -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$PWD/build/App.xcarchive" \
+            MARKETING_VERSION="$VER" CURRENT_PROJECT_VERSION="$BUILD" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            archive | tail -40
+          rm -rf Payload && mkdir Payload
+          cp -R build/App.xcarchive/Products/Applications/App.app Payload/
+          zip -qr "$GITHUB_WORKSPACE/openGym-$VER-unsigned.ipa" Payload
+          cd "$GITHUB_WORKSPACE"
+          sha256sum "openGym-$VER-unsigned.ipa" > "openGym-$VER-unsigned.ipa.sha256"
+          echo "IPA_NAME=openGym-$VER-unsigned.ipa" >> "$GITHUB_ENV"
+
+      - name: Upload the unsigned .ipa
+        uses: actions/upload-artifact@v4
+        with:
+          name: openGym-ios-unsigned
+          path: |
+            openGym-*-unsigned.ipa
+            openGym-*-unsigned.ipa.sha256
+          if-no-files-found: error
