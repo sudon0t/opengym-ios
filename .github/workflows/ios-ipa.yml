@@ -24,11 +24,11 @@ jobs:
   unsigned-ipa:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ github.event.inputs.ref || github.ref }}
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: "22"
 
@@ -64,7 +64,7 @@ jobs:
           echo "IPA_NAME=openGym-$VER-unsigned.ipa" >> "$GITHUB_ENV"
 
       - name: Upload the unsigned .ipa
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: openGym-ios-unsigned
           path: |
