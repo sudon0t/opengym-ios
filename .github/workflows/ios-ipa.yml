@@ -28,11 +28,11 @@ jobs:
     # was never migrated for. Change this line if a future Xcode is required.
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.inputs.ref || github.ref }}
 
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@v7
         with:
           node-version: "22"
           cache: npm
@@ -119,14 +119,14 @@ jobs:
 
       - name: Upload the xcodebuild log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: xcodebuild-log
           path: xcodebuild.log
           if-no-files-found: ignore
 
       - name: Upload the unsigned .ipa
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: openGym-ios-unsigned
           path: |
