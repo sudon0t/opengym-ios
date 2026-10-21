@@ -22,15 +22,21 @@ permissions:
 
 jobs:
   unsigned-ipa:
-    runs-on: macos-latest
+    # macos-15 ships Xcode 16, which is what Capacitor 7 is built and tested against. macos-latest
+    # now tracks a much newer Xcode, and the newer toolchains bring their own deployment-target
+    # floors and Swift-mode changes that this project (LastUpgradeCheck 920, SWIFT_VERSION 5.0)
+    # was never migrated for. Change this line if a future Xcode is required.
+    runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ github.event.inputs.ref || github.ref }}
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
 
       # Fail with a readable message instead of "/bin/bash: no such file or directory" when the
       # branch that was built does not actually carry the project (a workflow-file-only push).
@@ -39,18 +45,47 @@ jobs:
           set -eu
           test -f frontend/package.json || { echo "::error::frontend/ is missing from this branch — push the whole project, not just the workflow file"; exit 1; }
           test -d catalogue/media || { echo "::error::catalogue/media/ is missing from this branch"; exit 1; }
+          test -f frontend/ios/App/App.xcodeproj/project.pbxproj || { echo "::error::frontend/ios/ is missing from this branch"; exit 1; }
+          test -f frontend/android/app/build.gradle || { echo "::error::frontend/android/ is missing from this branch"; exit 1; }
           CLIPS=$(ls catalogue/media/clip | wc -l)
           STILLS=$(ls catalogue/media/still | wc -l)
           echo "exercise media in checkout: $STILLS stills, $CLIPS clips (expect 6554 each)"
           [ "$CLIPS" -ge 6554 ] || echo "::warning::only $CLIPS of 6554 exercise clips are on this branch — the app will build but most animations will be missing"
 
-      # VITE_MOBILE=1 vite build → stage the exercise media → cap sync (runs pod install on
-      # macOS) → check the bundle. Same command the maintainers use.
+      # VITE_MOBILE=1 vite build → stage the exercise media → cap sync (runs pod install for
+      # ios/ on macOS) → check the bundle. Same command the maintainers use.
       - name: Build the mobile web bundle
         working-directory: frontend
         run: |
+          set -eu
           npm ci
           npm run build:mobile
+
+      # cap sync is supposed to have run `pod install` for ios/ and produced the CocoaPods
+      # workspace. Verify it before asking xcodebuild to build, so a broken pod step reports
+      # itself instead of surfacing as a confusing "no such scheme" from xcodebuild.
+      - name: Verify the iOS workspace and pods
+        working-directory: frontend/ios/App
+        run: |
+          set -eu
+          test -f Podfile.lock || { echo "::error::Podfile.lock is missing — 'cap sync' did not run pod install"; exit 1; }
+          test -d Pods || { echo "::error::Pods/ is missing — 'cap sync' did not run pod install"; exit 1; }
+          test -f App.xcworkspace/contents.xcworkspacedata || { echo "::error::App.xcworkspace was not generated — 'cap sync' did not run pod install"; exit 1; }
+          xcodebuild -version | tr '\n' ' '; echo
+          xcodebuild -workspace App.xcworkspace -list || echo "::warning::could not list the workspace schemes"
+
+      # Read the version and the build number here, in frontend/, exactly like .gitlab-ci.yml does.
+      # Doing it after a `cd ios/App` breaks the relative path to android/app/build.gradle.
+      - name: Read the version and build number
+        working-directory: frontend
+        run: |
+          set -eu
+          VER="$(node -p "require('./package.json').version")"
+          BUILD="$(sed -n 's/^ *versionCode \([0-9]*\).*/\1/p' android/app/build.gradle | sed -n 1p)"
+          [ -n "$BUILD" ] || { echo "::error::could not read versionCode from frontend/android/app/build.gradle"; exit 1; }
+          echo "openGym $VER (build $BUILD)"
+          echo "APP_VERSION=$VER" >> "$GITHUB_ENV"
+          echo "APP_BUILD=$BUILD" >> "$GITHUB_ENV"
 
       # An .ipa is a zip with the .app under Payload/. No signing identity, so it installs
       # nowhere by itself — Sideloadly re-signs it with your Apple ID.
@@ -58,22 +93,37 @@ jobs:
         working-directory: frontend/ios/App
         run: |
           set -eu
-          VER="$(node -p "require('../../package.json').version")"
-          BUILD="$(sed -n 's/^ *versionCode \([0-9]*\).*/\1/p' ../android/app/build.gradle | sed -n 1p)"
-          [ -n "$BUILD" ] || { echo "could not read versionCode from android/app/build.gradle" >&2; exit 1; }
-          echo "openGym $VER (build $BUILD)"
-          xcodebuild -workspace App.xcworkspace -scheme App -configuration Release \
+          set -o pipefail
+          # pipefail matters here: without it a failing xcodebuild is masked by `tail` and the
+          # step would carry on with a half-built archive.
+          if ! xcodebuild -workspace App.xcworkspace -scheme App -configuration Release \
             -destination 'generic/platform=iOS' \
             -archivePath "$PWD/build/App.xcarchive" \
-            MARKETING_VERSION="$VER" CURRENT_PROJECT_VERSION="$BUILD" \
+            MARKETING_VERSION="$APP_VERSION" CURRENT_PROJECT_VERSION="$APP_BUILD" \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
-            archive | tail -40
+            archive 2>&1 | tee "$GITHUB_WORKSPACE/xcodebuild.log" | tail -60; then
+            echo "::error::xcodebuild failed — the last 60 lines are above, the full log is in the xcodebuild-log artifact"
+            tail -80 "$GITHUB_WORKSPACE/xcodebuild.log" >&2 || true
+            exit 1
+          fi
+          test -d build/App.xcarchive/Products/Applications/App.app || { echo "::error::the archive did not produce an App.app"; exit 1; }
+          # The .ipa must contain "Payload/App.app" at its root, so zip has to run from the
+          # directory that holds Payload/ — the output path is absolute, the input stays relative.
           rm -rf Payload && mkdir Payload
           cp -R build/App.xcarchive/Products/Applications/App.app Payload/
-          zip -qr "$GITHUB_WORKSPACE/openGym-$VER-unsigned.ipa" Payload
+          zip -qr "$GITHUB_WORKSPACE/openGym-$APP_VERSION-unsigned.ipa" Payload
           cd "$GITHUB_WORKSPACE"
-          sha256sum "openGym-$VER-unsigned.ipa" > "openGym-$VER-unsigned.ipa.sha256"
-          echo "IPA_NAME=openGym-$VER-unsigned.ipa" >> "$GITHUB_ENV"
+          sha256sum "openGym-$APP_VERSION-unsigned.ipa" > "openGym-$APP_VERSION-unsigned.ipa.sha256"
+          cat "openGym-$APP_VERSION-unsigned.ipa.sha256"
+          echo "IPA_NAME=openGym-$APP_VERSION-unsigned.ipa" >> "$GITHUB_ENV"
+
+      - name: Upload the xcodebuild log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-log
+          path: xcodebuild.log
+          if-no-files-found: ignore
 
       - name: Upload the unsigned .ipa
         uses: actions/upload-artifact@v4
